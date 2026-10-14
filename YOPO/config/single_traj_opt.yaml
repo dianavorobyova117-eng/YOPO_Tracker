@@ -1,17 +1,20 @@
 # YOPOv2-Tracker reproduction config.
+# 2026-10-14 M2 reparam (docs/design/dual-task-proposal.md §3 参数重设清单, local branch m2-reparam):
+#   band 0.5-2.5 m, low speed (vel 6->1.5), radio 5->1.5 (sgm_time auto 2.0 s, goal clip 3.0 m),
+#   follow 4.5/6.8/0.75 -> 1.2/2.0/0.2; camera intrinsics stay sim values (real calib pending).
 
 # IMPORTANT: follower velocity in testing (modifiable)
-velocity: 6
+velocity: 1.5
 
 # IMPORTANT: front target velocity/acceleration in testing.
 # If omitted, target falls back to velocity/acc_max_train.
-target_velocity: 5.0
-target_acc_max: 4.5
+target_velocity: 1.0
+target_acc_max: 1.0
 
 # IMPORTANT: vel_max and acc_max in training
 # not the actual values in testing, ensure consistency between testing and training, please refer to ../policy/primitive.py
-vel_max_train: 6.0
-acc_max_train: 6.0
+vel_max_train: 1.5
+acc_max_train: 1.5
 
 # IMPORTANT: weight of costs for unit speed (can be visualized in tensorboard)
 wg: 0.15   # guidance     (approaching the goal)
@@ -39,7 +42,7 @@ horizon_camera_fov: 90.0
 vertical_camera_fov: 60.0
 horizon_anchor_fov: 30.0
 vertical_anchor_fov: 30.0
-radio_range: 5.0    # planning horizon: 2 * radio_range
+radio_range: 1.5    # planning horizon: 2 * radio_range; sgm_time = 2*radio/vel_max = 2.0 s
 radio_num: 1        # only support 1 currently
 
 # safety penalties
@@ -91,11 +94,11 @@ target_ema_alpha: 0.35
 target_velocity_ema_alpha: 0.25
 
 # inference follow/hold behavior
-follow_distance: 4.5
-follow_deadband: 0.75
-follow_capture_distance: 6.8
+follow_distance: 1.2
+follow_deadband: 0.2
+follow_capture_distance: 2.0
 follow_target_speed_threshold: 0.25
-follow_max_step: 4.0
+follow_max_step: 1.0
 target_measurement_timeout: 0.4
 target_hold_timeout: 4.0
 use_mask_target_estimate: true

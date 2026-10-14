@@ -23,3 +23,7 @@ yopo_sim/
 bags/
 *.bag
 **/__pycache__
+
+# local training artifacts (m2-reparam)
+dataset_m1/
+YOPO/saved/with_tracker/YOPO_[0-9]*/
