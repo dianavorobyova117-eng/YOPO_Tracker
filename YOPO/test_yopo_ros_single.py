@@ -54,6 +54,11 @@ class YopoTracker:
         self.target_mask_timeout = cfg["target_mask_timeout"]
         self.target_lost_timeout = cfg["target_lost_timeout"]
         self.target_mask_min_pixels = int(cfg["target_mask_min_pixels"])
+        # 临时妥协(2026-10-15 用户拍板,仅工程侧仿真测试期,模型侧具备重捕获能力后删除):
+        # 上游 lost-brake 在目标出 FOV 超时后丢弃网络输出、强制刹停悬停(架空模型)。
+        # 置环境变量 YOPO_TEMP_NO_LOST_BRAKE=1 时跳过该覆盖,网络输出照常执行;
+        # 丢失后的重捕获由测试员手动发目标当前位置补位(sim/m2/shepherd.py,目标先停下)。
+        self.temp_no_lost_brake = os.environ.get("YOPO_TEMP_NO_LOST_BRAKE", "0") == "1"
         self.Rotation_bc = R.from_euler('ZYX', [0, self.config['pitch_angle_deg'], 0], degrees=True).as_matrix()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -328,7 +333,8 @@ class YopoTracker:
             start_vel = self.get_current_velocity()
             poly_start_vel = start_vel
             poly_start_acc = self.desire_acc
-            lost_setpoint = self.get_lost_target_setpoint(start_pos)
+            # 临时妥协(同 __init__ 处注释,模型不被架空:工程侧仿真测试期跳过 lost-brake 覆盖)
+            lost_setpoint = None if self.temp_no_lost_brake else self.get_lost_target_setpoint(start_pos)
             hold_setpoint = lost_setpoint if lost_setpoint is not None else self.get_tracking_setpoint(start_pos)
             if hold_setpoint is None:
                 self.hold_mode = False
