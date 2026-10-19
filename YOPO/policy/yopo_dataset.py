@@ -12,6 +12,32 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config.config import cfg
 
 
+def _cfg_get(key, default=None):
+    """cfg(Config)只实现 __getitem__;新键未写进旧配置文件时取默认。"""
+    try:
+        return cfg[key]
+    except KeyError:
+        return default
+
+
+def lag_displacement_px(target_vel_c, depth, age_s):
+    """证据龄 → mask 中心滞后位移(像素;按龄折减的训练侧同折减)。
+
+    部署端把检测置信度按证据龄线性折减(≤0.3s 全额、≥0.7s 归零,
+    deploy/proto/defaults.py);训练数据里目标只进二值 mask 通道,
+    同一一致性的编码是:mask 标在 δ 秒前的旧位置,位移 = 目标相机系
+    速度 × δ。投影与 Simulator/src/src/dataset_generator.cpp 的
+    projectTarget 同式(u = cx − fx·y/x、v = cy − fy·z/x),
+    mask 落后于当前位置,即 Δu = +fx·v_y·δ/depth、Δv = +fy·v_z·δ/depth。
+    """
+    fx = float(cfg["camera_fx"])
+    fy = float(cfg["camera_fy"])
+    if depth <= 0.1:
+        return np.zeros(2, dtype=np.float32)
+    return np.array([fx * target_vel_c[1] * age_s / depth,
+                     fy * target_vel_c[2] * age_s / depth], dtype=np.float32)
+
+
 class YOPODataset(Dataset):
     def __init__(self, mode='train', val_ratio=0.1):
         super(YOPODataset, self).__init__()
@@ -46,6 +72,13 @@ class YOPODataset(Dataset):
         self.target_mask_false_positive_max = int(cfg["target_mask_false_positive_max"])
         self.target_mask_false_positive_min_px = int(cfg["target_mask_false_positive_min_px"])
         self.target_mask_false_positive_max_px = int(cfg["target_mask_false_positive_max_px"])
+        # 按龄折减增广:默认关;参数由链路实测拟合后启用(常数值与
+        # deploy/proto/defaults.py 的折减常数对齐,不在此另立)
+        self.target_mask_lag_enable = bool(_cfg_get("target_mask_lag_enable", False))
+        self.target_mask_lag_prob = float(_cfg_get("target_mask_lag_prob", 0.5))
+        self.target_mask_lag_age_min_s = float(_cfg_get("target_mask_lag_age_min_s", 0.05))
+        self.target_mask_lag_age_max_s = float(_cfg_get("target_mask_lag_age_max_s", 0.7))
+        self.target_mask_lag_kill_prob = float(_cfg_get("target_mask_lag_kill_prob", 0.12))
 
         datafolders = [f.path for f in os.scandir(data_dir) if f.is_dir()]
         datafolders.sort(key=lambda x: int(os.path.basename(x)))
@@ -149,8 +182,10 @@ class YOPODataset(Dataset):
         target_uv = target_row[7:9].astype(np.float32)
         target_c = R_WC.inv().apply(target_w - self.positions[item]).astype(np.float32)
         target_depth = np.float32(target_row[9])
+        target_vel_c = R_WC.inv().apply(target_vel_w).astype(np.float32)
 
-        mask = self._load_or_build_mask(self.mask_list[item], target_visible, target_uv, target_depth)
+        mask = self._load_or_build_mask(self.mask_list[item], target_visible, target_uv,
+                                        target_depth, target_vel_c)
         image = np.concatenate((depth[None, :, :], mask[None, :, :]), axis=0).astype(np.float32)
 
         return (
@@ -166,7 +201,7 @@ class YOPODataset(Dataset):
             self.map_idx[item],
         )
 
-    def _load_or_build_mask(self, mask_path, target_visible, target_uv, target_depth):
+    def _load_or_build_mask(self, mask_path, target_visible, target_uv, target_depth, target_vel_c=None):
         if os.path.exists(mask_path):
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             mask = cv2.resize(mask, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
@@ -174,7 +209,7 @@ class YOPODataset(Dataset):
         else:
             mask = self._build_bbox_mask(target_visible, target_uv, target_depth)
         if self.mode == 'train' and self.target_mask_augment:
-            mask = self._augment_mask(mask, target_visible, target_uv, target_depth)
+            mask = self._augment_mask(mask, target_visible, target_uv, target_depth, target_vel_c)
         return mask.astype(np.float32)
 
     def _build_bbox_mask(self, target_visible, target_uv, target_depth, center_jitter=None, scale=1.0):
@@ -198,11 +233,28 @@ class YOPODataset(Dataset):
         mask[v0:v1 + 1, u0:u1 + 1] = 1.0
         return mask
 
-    def _augment_mask(self, clean_mask, target_visible, target_uv, target_depth):
-        if target_visible >= 0.5 and np.random.rand() >= self.target_mask_dropout_prob:
+    def _sample_lag_px(self, target_vel_c, target_depth):
+        """采样证据龄并转 mask 中心滞后;返回 None = 龄过 kill 点(整框丢弃)。
+
+        龄分布是链路实测的拟合位:kill 比例默认取热点轮死帧实测,
+        age 上界默认取折减归零常数。关闭时不消耗随机数,行为与旧版一致。
+        """
+        if not self.target_mask_lag_enable or target_vel_c is None:
+            return np.zeros(2, dtype=np.float32)
+        if np.random.rand() < self.target_mask_lag_kill_prob:
+            return None
+        if np.random.rand() >= self.target_mask_lag_prob:
+            return np.zeros(2, dtype=np.float32)
+        age_s = np.random.uniform(self.target_mask_lag_age_min_s, self.target_mask_lag_age_max_s)
+        return lag_displacement_px(target_vel_c, target_depth, age_s)
+
+    def _augment_mask(self, clean_mask, target_visible, target_uv, target_depth, target_vel_c=None):
+        lag = self._sample_lag_px(target_vel_c, target_depth)
+        if target_visible >= 0.5 and lag is not None \
+                and np.random.rand() >= self.target_mask_dropout_prob:
             jitter = np.random.uniform(-self.target_mask_jitter_px, self.target_mask_jitter_px, size=2)
             scale = 1.0 + np.random.uniform(-self.target_mask_scale_jitter, self.target_mask_scale_jitter)
-            mask = self._build_bbox_mask(target_visible, target_uv, target_depth, jitter, max(scale, 0.2))
+            mask = self._build_bbox_mask(target_visible, target_uv, target_depth, jitter + lag, max(scale, 0.2))
         else:
             mask = np.zeros_like(clean_mask)
 

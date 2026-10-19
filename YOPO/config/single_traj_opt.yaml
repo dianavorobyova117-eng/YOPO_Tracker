@@ -82,6 +82,14 @@ target_mask_false_positive_prob: 0.15
 target_mask_false_positive_max: 2
 target_mask_false_positive_min_px: 3
 target_mask_false_positive_max_px: 18
+# 按龄折减增广(训练侧同折减,与 deploy/proto/defaults.py 折减常数对齐):
+# mask 中心按 目标速度×采样龄 滞后;kill_prob=龄过 kill 点(0.7s)整框丢弃比例。
+# 默认关;参数由链路实测拟合(热点轮死帧比 11.9%)后启用。
+target_mask_lag_enable: false
+target_mask_lag_prob: 0.5
+target_mask_lag_age_min_s: 0.05
+target_mask_lag_age_max_s: 0.7
+target_mask_lag_kill_prob: 0.12
 objectness_weight: 1.0
 target_position_weight: 1.0
 objectness_positive_weight: 5.0
