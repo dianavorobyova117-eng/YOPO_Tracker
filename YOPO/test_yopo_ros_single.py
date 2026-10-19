@@ -27,6 +27,94 @@ except ImportError:
     print("tensorrt not found.")
 
 
+class StressMaskInjector:
+    """检测形退化注入(压力测,2026-10-19;env YOPO_STRESS_MASK,缺省不注入)。
+
+    用途=sim/m2 压力测:在闭环链路上把干净的渲染 mask 按"检测器会有的毛病"
+    退化后再交给网络与目标估计,量当前权重对脏输入的敏感度。形态与档位是
+    声明过的合成压力档(铁律 8 四问在 sim/m2/run-notes.md 压力测节),
+    不预报真链分布;参数与部署检测链无单源关系(真链分布待实测录制拟合)。
+
+    规格(逗号分隔,可组合):
+      quant<S>  取 mask 外接框、四边对齐到 S 像素网格,回填竖长方形(高=1.5×宽,
+                合成常数)——模拟检测框的矩形+量化
+      drop<p>   每帧以概率 p 整帧丢弃(漏检)
+      fp<p>     每帧以概率 p 并入一个 6-20px 假阳方块
+      lag<t>    输出 t 秒前的帧内容、时间戳仍盖当前到达帧(时戳乐观界;
+                悲观界=内容过旧被新鲜度门丢弃,由 drop 档代表)
+    """
+
+    def __init__(self, quant_px=0, drop_p=0.0, fp_p=0.0, lag_s=0.0, seed=None):
+        self.quant_px = int(quant_px)
+        self.drop_p = float(drop_p)
+        self.fp_p = float(fp_p)
+        self.lag_s = float(lag_s)
+        self.rng = np.random.RandomState(seed)
+        self.history = []  # (stamp_s, mask_u8)
+        if quant_px or drop_p or fp_p or lag_s:
+            rospy.logwarn("StressMaskInjector active: quant=%d drop=%.2f fp=%.2f lag=%.2f",
+                          quant_px, drop_p, fp_p, lag_s)
+
+    @classmethod
+    def from_env(cls):
+        spec = os.environ.get("YOPO_STRESS_MASK", "").strip()
+        if not spec:
+            return cls()
+        seed = os.environ.get("YOPO_STRESS_SEED")
+        kv = dict(quant_px=0, drop_p=0.0, fp_p=0.0, lag_s=0.0,
+                  seed=int(seed) if seed is not None else None)
+        for part in spec.split(","):
+            part = part.strip()
+            for key in ("quant", "drop", "fp", "lag"):
+                if part.startswith(key):
+                    kv[key + ("_px" if key == "quant" else ("_p" if key in ("drop", "fp") else "_s"))] = float(part[len(key):])
+        return cls(**kv)
+
+    def _quantize(self, mask):
+        ys, xs = np.nonzero(mask)
+        if ys.size == 0:
+            return mask
+        out = np.zeros_like(mask)
+        s = self.quant_px
+        v0, v1 = (ys.min() // s) * s, ((ys.max() + s) // s) * s
+        u0, u1 = (xs.min() // s) * s, ((xs.max() + s) // s) * s
+        h = max(v1 - v0, s)
+        w = max(int(round(h / 1.5)), s)  # 竖长方形,高=1.5×宽(合成常数)
+        cv = (v0 + v1) // 2
+        cu = (u0 + u1) // 2
+        v0, v1 = max(0, cv - h // 2), min(mask.shape[0], cv - h // 2 + h)
+        u0, u1 = max(0, cu - w // 2), min(mask.shape[1], cu - w // 2 + w)
+        out[v0:v1, u0:u1] = 255
+        return out
+
+    def _false_positive(self, mask):
+        half = int(self.rng.randint(3, 11))
+        v = int(self.rng.randint(0, mask.shape[0]))
+        u = int(self.rng.randint(0, mask.shape[1]))
+        mask[max(0, v - half):v + half, max(0, u - half):u + half] = 255
+        return mask
+
+    def inject(self, mask, stamp_s):
+        if not (self.quant_px or self.drop_p or self.fp_p or self.lag_s):
+            return mask
+        m = mask
+        if self.drop_p > 0 and self.rng.rand() < self.drop_p:
+            m = np.zeros_like(m)
+        elif self.quant_px:
+            m = self._quantize(m)
+        if self.fp_p > 0 and self.rng.rand() < self.fp_p:
+            m = self._false_positive(m.copy())
+        if self.lag_s > 0:
+            self.history.append((stamp_s, m))
+            chosen = None
+            for old_s, old_m in self.history:  # 取满足龄的最旧→最新扫描,留最后一个
+                if stamp_s - old_s >= self.lag_s:
+                    chosen = old_m
+            self.history = [(s, mm) for s, mm in self.history if stamp_s - s <= self.lag_s + 1.0]
+            m = chosen if chosen is not None else np.zeros_like(mask)
+        return m
+
+
 class YopoTracker:
     def __init__(self, config, weight):
         self.config = config
@@ -59,6 +147,8 @@ class YopoTracker:
         # 置环境变量 YOPO_TEMP_NO_LOST_BRAKE=1 时跳过该覆盖,网络输出照常执行;
         # 丢失后的重捕获由测试员手动发目标当前位置补位(sim/m2/shepherd.py,目标先停下)。
         self.temp_no_lost_brake = os.environ.get("YOPO_TEMP_NO_LOST_BRAKE", "0") == "1"
+        # 压力测注入(2026-10-19):退化发生在收图回调,网络输入与目标估计同源同脏
+        self.stress_mask = StressMaskInjector.from_env()
         self.Rotation_bc = R.from_euler('ZYX', [0, self.config['pitch_angle_deg'], 0], degrees=True).as_matrix()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -176,6 +266,7 @@ class YopoTracker:
             mask = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             return
+        mask = self.stress_mask.inject(mask, data.header.stamp.to_sec())
         self.latest_target_mask = mask.copy()
         self.latest_target_mask_stamp = data.header.stamp
 
